@@ -14,10 +14,16 @@
 (define-constant ERR_PROPOSAL_NOT_FOUND (err u107))
 (define-constant ERR_ALREADY_VOTED (err u108))
 (define-constant ERR_VOTING_ENDED (err u109))
+(define-constant ERR_INVALID_RATING (err u110))
+(define-constant ERR_ALREADY_RATED (err u111))
+(define-constant ERR_INSUFFICIENT_REPUTATION (err u112))
+(define-constant ERR_REWARD_NOT_FOUND (err u113))
+(define-constant ERR_REWARD_ALREADY_CLAIMED (err u114))
 
 (define-data-var next-space-id uint u1)
 (define-data-var next-booking-id uint u1)
 (define-data-var next-proposal-id uint u1)
+(define-data-var next-reward-id uint u1)
 (define-data-var membership-fee uint u1000000)
 (define-data-var booking-fee-per-hour uint u100000)
 
@@ -76,6 +82,47 @@
   { balance: uint }
 )
 
+(define-map user-reputation
+  { user: principal }
+  {
+    total-points: uint,
+    level: uint,
+    bookings-completed: uint,
+    spaces-hosted: uint,
+    positive-reviews: uint,
+    negative-reviews: uint,
+    community-contributions: uint
+  }
+)
+
+(define-map space-ratings
+  { space-id: uint, rater: principal }
+  {
+    rating: uint,
+    comment: (string-ascii 200),
+    created-at: uint
+  }
+)
+
+(define-map reputation-rewards
+  { reward-id: uint }
+  {
+    name: (string-ascii 50),
+    description: (string-ascii 200),
+    points-required: uint,
+    reward-amount: uint,
+    max-claims: uint,
+    current-claims: uint,
+    active: bool,
+    created-by: principal
+  }
+)
+
+(define-map user-rewards-claimed
+  { user: principal, reward-id: uint }
+  { claimed-at: uint }
+)
+
 (define-public (join-dao)
   (let ((membership-cost (var-get membership-fee)))
     (try! (deduct-balance tx-sender membership-cost))
@@ -87,6 +134,7 @@
         total-bookings: u0
       }
     )
+    (initialize-user-reputation tx-sender)
     (ok true)
   )
 )
@@ -105,6 +153,7 @@
       }
     )
     (var-set next-space-id (+ space-id u1))
+    (award-reputation-points tx-sender u10 "space-hosted")
     (ok space-id)
   )
 )
@@ -139,6 +188,7 @@
     )
     
     (update-member-stats tx-sender)
+    (award-reputation-points tx-sender u5 "booking-made")
     (var-set next-booking-id (+ booking-id u1))
     (ok booking-id)
   )
@@ -158,6 +208,7 @@
       { space-id: (get space-id booking) }
       (merge (unwrap-panic (map-get? spaces { space-id: (get space-id booking) })) { available: true })
     )
+    (award-reputation-points (get user booking) u3 "booking-completed")
     (ok true)
   )
 )
@@ -188,6 +239,7 @@
       }
     )
     (var-set next-proposal-id (+ proposal-id u1))
+    (award-reputation-points tx-sender u2 "proposal-created")
     (ok proposal-id)
   )
 )
@@ -216,6 +268,7 @@
         (merge proposal { votes-against: (+ (get votes-against proposal) voting-power) })
       )
     )
+    (award-reputation-points tx-sender u1 "voted-on-proposal")
     (ok true)
   )
 )
@@ -232,6 +285,109 @@
   (begin
     (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_NOT_AUTHORIZED)
     (var-set booking-fee-per-hour new-fee)
+    (ok true)
+  )
+)
+
+(define-public (rate-space (space-id uint) (rating uint) (comment (string-ascii 200)))
+  (begin
+    (asserts! (is-member tx-sender) ERR_NOT_MEMBER)
+    (asserts! (is-some (map-get? spaces { space-id: space-id })) ERR_SPACE_NOT_FOUND)
+    (asserts! (and (>= rating u1) (<= rating u5)) ERR_INVALID_RATING)
+    (asserts! (is-none (map-get? space-ratings { space-id: space-id, rater: tx-sender })) ERR_ALREADY_RATED)
+    
+    (map-set space-ratings
+      { space-id: space-id, rater: tx-sender }
+      {
+        rating: rating,
+        comment: comment,
+        created-at: stacks-block-height
+      }
+    )
+    
+    (begin
+      (if (>= rating u4)
+        (award-reputation-points tx-sender u2 "positive-review-given")
+        true
+      )
+      (ok true)
+    )
+  )
+)
+
+(define-public (create-reputation-reward 
+  (name (string-ascii 50)) 
+  (description (string-ascii 200)) 
+  (points-required uint) 
+  (reward-amount uint) 
+  (max-claims uint))
+  (let ((reward-id (var-get next-reward-id)))
+    (asserts! (is-member tx-sender) ERR_NOT_MEMBER)
+    (asserts! (> points-required u0) ERR_INVALID_RATING)
+    (asserts! (> reward-amount u0) ERR_INVALID_RATING)
+    (asserts! (> max-claims u0) ERR_INVALID_RATING)
+    
+    (map-set reputation-rewards
+      { reward-id: reward-id }
+      {
+        name: name,
+        description: description,
+        points-required: points-required,
+        reward-amount: reward-amount,
+        max-claims: max-claims,
+        current-claims: u0,
+        active: true,
+        created-by: tx-sender
+      }
+    )
+    
+    (var-set next-reward-id (+ reward-id u1))
+    (award-reputation-points tx-sender u5 "reward-created")
+    (ok reward-id)
+  )
+)
+
+(define-public (claim-reputation-reward (reward-id uint))
+  (let (
+    (reward (unwrap! (map-get? reputation-rewards { reward-id: reward-id }) ERR_REWARD_NOT_FOUND))
+    (user-rep-data (get-user-reputation-data tx-sender))
+    (user-points (get total-points user-rep-data))
+  )
+    (asserts! (is-member tx-sender) ERR_NOT_MEMBER)
+    (asserts! (get active reward) ERR_REWARD_NOT_FOUND)
+    (asserts! (< (get current-claims reward) (get max-claims reward)) ERR_REWARD_NOT_FOUND)
+    (asserts! (>= user-points (get points-required reward)) ERR_INSUFFICIENT_REPUTATION)
+    (asserts! (is-none (map-get? user-rewards-claimed { user: tx-sender, reward-id: reward-id })) ERR_REWARD_ALREADY_CLAIMED)
+    
+    (map-set user-rewards-claimed
+      { user: tx-sender, reward-id: reward-id }
+      { claimed-at: stacks-block-height }
+    )
+    
+    (map-set reputation-rewards
+      { reward-id: reward-id }
+      (merge reward { current-claims: (+ (get current-claims reward) u1) })
+    )
+    
+    (let ((current-balance (get-balance tx-sender)))
+      (map-set user-balances
+        { user: tx-sender }
+        { balance: (+ current-balance (get reward-amount reward)) }
+      )
+    )
+    
+    (ok true)
+  )
+)
+
+(define-public (toggle-reward-status (reward-id uint))
+  (let ((reward (unwrap! (map-get? reputation-rewards { reward-id: reward-id }) ERR_REWARD_NOT_FOUND)))
+    (asserts! (is-eq tx-sender (get created-by reward)) ERR_NOT_AUTHORIZED)
+    
+    (map-set reputation-rewards
+      { reward-id: reward-id }
+      (merge reward { active: (not (get active reward)) })
+    )
     (ok true)
   )
 )
@@ -272,6 +428,34 @@
   (map-get? votes { proposal-id: proposal-id, voter: voter })
 )
 
+(define-read-only (get-user-reputation (user principal))
+  (map-get? user-reputation { user: user })
+)
+
+(define-read-only (get-space-rating (space-id uint) (rater principal))
+  (map-get? space-ratings { space-id: space-id, rater: rater })
+)
+
+(define-read-only (get-reputation-reward (reward-id uint))
+  (map-get? reputation-rewards { reward-id: reward-id })
+)
+
+(define-read-only (get-user-reward-claim (user principal) (reward-id uint))
+  (map-get? user-rewards-claimed { user: user, reward-id: reward-id })
+)
+
+(define-read-only (get-user-reputation-level (user principal))
+  (let ((reputation-data (get-user-reputation-data user)))
+    (get level reputation-data)
+  )
+)
+
+(define-read-only (get-user-reputation-points (user principal))
+  (let ((reputation-data (get-user-reputation-data user)))
+    (get total-points reputation-data)
+  )
+)
+
 (define-private (deduct-balance (user principal) (amount uint))
   (let ((current-balance (get-balance user)))
     (asserts! (>= current-balance amount) ERR_INSUFFICIENT_BALANCE)
@@ -290,6 +474,84 @@
       (merge member-data { 
         total-bookings: (+ (get total-bookings member-data) u1),
         voting-power: (+ (get voting-power member-data) u1)
+      })
+    )
+  )
+)
+
+(define-private (initialize-user-reputation (user principal))
+  (map-set user-reputation
+    { user: user }
+    {
+      total-points: u0,
+      level: u1,
+      bookings-completed: u0,
+      spaces-hosted: u0,
+      positive-reviews: u0,
+      negative-reviews: u0,
+      community-contributions: u0
+    }
+  )
+)
+
+(define-private (get-user-reputation-data (user principal))
+  (default-to
+    {
+      total-points: u0,
+      level: u1,
+      bookings-completed: u0,
+      spaces-hosted: u0,
+      positive-reviews: u0,
+      negative-reviews: u0,
+      community-contributions: u0
+    }
+    (map-get? user-reputation { user: user })
+  )
+)
+
+(define-private (calculate-reputation-level (points uint))
+  (if (<= points u50)
+    u1
+    (if (<= points u150)
+      u2
+      (if (<= points u300)
+        u3
+        (if (<= points u500)
+          u4
+          u5
+        )
+      )
+    )
+  )
+)
+
+(define-private (award-reputation-points (user principal) (points uint) (activity (string-ascii 50)))
+  (let (
+    (current-reputation (get-user-reputation-data user))
+    (new-total-points (+ (get total-points current-reputation) points))
+    (new-level (calculate-reputation-level new-total-points))
+  )
+    (map-set user-reputation
+      { user: user }
+      (merge current-reputation {
+        total-points: new-total-points,
+        level: new-level,
+        bookings-completed: (if (is-eq activity "booking-completed")
+          (+ (get bookings-completed current-reputation) u1)
+          (get bookings-completed current-reputation)
+        ),
+        spaces-hosted: (if (is-eq activity "space-hosted")
+          (+ (get spaces-hosted current-reputation) u1)
+          (get spaces-hosted current-reputation)
+        ),
+        positive-reviews: (if (is-eq activity "positive-review-given")
+          (+ (get positive-reviews current-reputation) u1)
+          (get positive-reviews current-reputation)
+        ),
+        community-contributions: (if (or (is-eq activity "proposal-created") (is-eq activity "reward-created"))
+          (+ (get community-contributions current-reputation) u1)
+          (get community-contributions current-reputation)
+        )
       })
     )
   )
